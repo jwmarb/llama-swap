@@ -18,12 +18,9 @@ import (
 	"time"
 )
 
-// sleepLevel represents the vLLM sleep level.
-type sleepLevel int
+const httpTimeout = 30 * time.Second
 
-const (
-	sleepLevel1 sleepLevel = 1
-)
+var httpClient = &http.Client{Timeout: httpTimeout}
 
 // vllmWrapper serves as a cmd/cmdStop wrapper for vLLM with sleep mode.
 func main() {
