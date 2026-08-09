@@ -8,6 +8,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -745,5 +747,79 @@ func TestProcessCommand_ConcurrentRunStop(t *testing.T) {
 				p.Stop(testStopTimeout) //nolint: errcheck
 			}
 		}
+	}
+}
+
+// TestProcessCommand_ParentCtxCancelSkipsCmdStop verifies that cancelling the
+// parent context causes killProcess to skip CmdStop and send SIGQUIT directly,
+// so an upstream wrapper can distinguish normal swap-out (CmdStop) from hard
+// teardown. We confirm this by asserting the CmdStop marker file is NOT created.
+func TestProcessCommand_ParentCtxCancelSkipsCmdStop(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skip: CmdStop marker test uses bash; Windows variant would need PowerShell")
+	}
+
+	dir := t.TempDir()
+	marker := filepath.Join(dir, "cmdstop-marker")
+
+	// CmdStop would create the marker if it were executed.
+	cmdStop := fmt.Sprintf("touch %s", marker)
+
+	// Use sleep as a long-lived process (health check disabled).
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	logger := logmon.NewWriter(io.Discard)
+	p, err := New(parentCtx, t.Name(), config.ModelConfig{
+		Cmd:                "sleep 60",
+		Proxy:              "http://127.0.0.1:1",
+		CheckEndpoint:      "none",
+		CmdStop:            cmdStop,
+		HealthCheckTimeout: 10,
+	}, logger, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Start the process without blocking on Run.
+	// We use EnsureReady-style path: send a non-blocking start request.
+	startReq := startReq{
+		timeout: testStartTimeout,
+		respond: make(chan error, 1),
+		block:   false,
+	}
+	select {
+	case p.startCh <- startReq:
+	case <-time.After(testStartTimeout):
+		t.Fatal("timeout sending start request")
+	}
+	err = <-startReq.respond
+	if err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	// Verify process is ready before cancelling.
+	if p.State() != StateReady {
+		t.Fatalf("expected StateReady before cancel, got %s", p.State())
+	}
+
+	// Cancel parent context to trigger shutdown via parentCtx.Done().
+	cancelParent()
+
+	// Wait for shutdown.
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := p.State(); s == StateShutdown {
+			break
+		}
+		time.Sleep(testPollInterval)
+	}
+	if p.State() != StateShutdown {
+		t.Fatalf("expected StateShutdown after parent cancel, got %s", p.State())
+	}
+
+	// CmdStop was skipped, so the marker must NOT exist.
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("CmdStop marker file exists — CmdStop was executed instead of being skipped")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("unexpected error checking marker: %v", err)
 	}
 }

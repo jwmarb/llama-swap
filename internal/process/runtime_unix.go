@@ -28,6 +28,13 @@ func killProcessTree(cmd *exec.Cmd) error {
 	return signalProcessTree(cmd, syscall.SIGKILL)
 }
 
+// quitProcessTree sends SIGQUIT to the whole process group, causing the
+// default Go runtime behavior (stack dump + exit) for programs that don't
+// handle it, while allowing programs that do handle it to perform cleanup.
+func quitProcessTree(cmd *exec.Cmd) error {
+	return signalProcessTree(cmd, syscall.SIGQUIT)
+}
+
 // signalProcessTree signals the process group led by cmd.Process. Because the
 // child was started with Setpgid it is its own group leader (pgid == pid), so
 // targeting -pid reaches the child and every descendant still in the group.

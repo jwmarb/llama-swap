@@ -194,7 +194,7 @@ func (p *ProcessCommand) run() {
 			setState(StateShutdown)
 			if cmd != nil {
 				p.handler.Store(nil)
-				p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout)
+				p.killProcess(cmd, cmdCancel, cmdDone, parentCancelGraceTimeout, true)
 				cmd = nil
 				cmdDone = nil
 				cmdCancel = nil
@@ -339,7 +339,7 @@ func (p *ProcessCommand) run() {
 				cancelStart()
 				res := <-resultCh
 				if res.cmd != nil {
-					p.killProcess(res.cmd, res.cancel, res.cmdDone, stop.timeout)
+					p.killProcess(res.cmd, res.cancel, res.cmdDone, stop.timeout, false)
 				}
 				setState(StateStopped)
 				notifyWaiters(ErrStartAborted)
@@ -359,7 +359,7 @@ func (p *ProcessCommand) run() {
 				setState(StateShutdown)
 				res := <-resultCh
 				if res.cmd != nil {
-					p.killProcess(res.cmd, res.cancel, res.cmdDone, parentCancelGraceTimeout)
+					p.killProcess(res.cmd, res.cancel, res.cmdDone, parentCancelGraceTimeout, true)
 				}
 				notifyWaiters(fmt.Errorf("[%s] shutdown", p.id))
 				respondRun(fmt.Errorf("[%s] shutdown", p.id))
@@ -377,7 +377,7 @@ func (p *ProcessCommand) run() {
 			toreDown := cmd != nil
 			if cmd != nil {
 				setState(StateStopping)
-				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout)
+				p.killProcess(cmd, cmdCancel, cmdDone, stop.timeout, false)
 				cmd = nil
 				cmdDone = nil
 				cmdCancel = nil
@@ -498,7 +498,7 @@ func (p *ProcessCommand) doStart(startCtx context.Context, healthCheckTimeout ti
 	}()
 
 	abort := func(err error) startResult {
-		p.killProcess(cmd, cmdCancel, cmdDone, 5*time.Second)
+		p.killProcess(cmd, cmdCancel, cmdDone, 5*time.Second, false)
 		return startResult{err: err}
 	}
 	prematureExit := func() startResult {
@@ -619,10 +619,15 @@ func (p *ProcessCommand) sendStopSignal(cmd *exec.Cmd) error {
 //     from process exit (see os/exec awaitGoroutines), not from this call.
 //     Without WaitDelay this select would hang forever (the v219 bug).
 //
+// When skipCmdStop is true (e.g. config reload / shutdown), the CmdStop
+// command is skipped and SIGQUIT is sent directly to the process group
+// instead, allowing the wrapper to distinguish normal swap-out (SIGTERM via
+// CmdStop) from hard teardown (SIGQUIT).
+//
 // cancel() is still invoked (deferred) to release the context, but only after
 // the process has exited and os/exec's ctx watcher has already torn down, so it
 // never re-fires cmd.Cancel.
-func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, cmdDone <-chan struct{}, gracefulTimeout time.Duration) {
+func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, cmdDone <-chan struct{}, gracefulTimeout time.Duration, skipCmdStop bool) {
 	if cancel == nil {
 		return
 	}
@@ -633,9 +638,16 @@ func (p *ProcessCommand) killProcess(cmd *exec.Cmd, cancel context.CancelFunc, c
 	// path below still guarantees teardown.
 	if cmd != nil {
 		go func() {
-			p.proxyLogger.Debugf("[%s] sending stop signal with timeout %v", p.id, gracefulTimeout)
-			if err := p.sendStopSignal(cmd); err != nil {
-				p.proxyLogger.Warnf("[%s] stop signal failed: %v", p.id, err)
+			if skipCmdStop {
+				p.proxyLogger.Debugf("[%s] skipping CmdStop (shutdown), sending SIGQUIT to process tree", p.id)
+				if err := quitProcessTree(cmd); err != nil {
+					p.proxyLogger.Warnf("[%s] SIGQUIT failed: %v", p.id, err)
+				}
+			} else {
+				p.proxyLogger.Debugf("[%s] sending stop signal with timeout %v", p.id, gracefulTimeout)
+				if err := p.sendStopSignal(cmd); err != nil {
+					p.proxyLogger.Warnf("[%s] stop signal failed: %v", p.id, err)
+				}
 			}
 		}()
 	}

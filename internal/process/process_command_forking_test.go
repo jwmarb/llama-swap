@@ -3,7 +3,9 @@
 package process
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/config"
+	"github.com/mostlygeek/llama-swap/internal/logmon"
 )
 
 // TestProcessCommand_StopForkingWrapper is a regression for the bug reported
@@ -259,4 +262,79 @@ func killChildFromPidFile(pidFile string) {
 		return
 	}
 	_ = proc.Kill()
+}
+
+// TestProcessCommand_ParentCtxCancelSendsSigQuit verifies that cancelling the
+// parent context actually sends SIGQUIT (not SIGTERM) to the process. We use
+// a bash script that traps/ignores SIGTERM; SIGQUIT is not trapped so bash
+// exits by default. With parentCancelGraceTimeout = 1s, if SIGTERM were sent
+// the process would survive to SIGKILL at 1s. If SIGQUIT is sent it exits
+// immediately. We assert exit happens well before the SIGKILL escalation.
+func TestProcessCommand_ParentCtxCancelSendsSigQuit(t *testing.T) {
+	dir := t.TempDir()
+	// Script ignores SIGTERM (trap ""), so SIGTERM from a regular CmdStop path
+	// would be a no-op and the process would only die via SIGKILL at 1s.
+	// SIGQUIT is not trapped, so bash exits immediately on SIGQUIT (the
+	// default Go-like behavior: stack dump + exit).
+	script := filepath.Join(dir, "ignore-term.sh")
+	body := "#!/bin/bash\ntrap '' SIGTERM\nwhile true; do sleep 0.1; done\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
+
+	parentCtx, cancelParent := context.WithCancel(context.Background())
+	logger := logmon.NewWriter(io.Discard)
+	p, err := New(parentCtx, t.Name(), config.ModelConfig{
+		Cmd:           script,
+		Proxy:         "http://127.0.0.1:1",
+		CheckEndpoint: "none",
+	}, logger, logger)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	// Start the process.
+	startReq := startReq{
+		timeout: testStartTimeout,
+		respond: make(chan error, 1),
+		block:   false,
+	}
+	select {
+	case p.startCh <- startReq:
+	case <-time.After(testStartTimeout):
+		t.Fatal("timeout sending start request")
+	}
+	if err := <-startReq.respond; err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	if p.State() != StateReady {
+		t.Fatalf("expected StateReady before cancel, got %s", p.State())
+	}
+
+	// Measure how long shutdown takes. If SIGQUIT is delivered, bash exits
+	// immediately (<100ms). If SIGTERM were delivered instead, it would be
+	// ignored and SIGKILL would escalate at 1s.
+	start := time.Now()
+	cancelParent()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if s := p.State(); s == StateShutdown {
+			break
+		}
+		time.Sleep(testPollInterval)
+	}
+	elapsed := time.Since(start)
+
+	if p.State() != StateShutdown {
+		t.Fatalf("expected StateShutdown after parent cancel, got %s (elapsed=%v)", p.State(), elapsed)
+	}
+
+	// Assert shutdown completed well before the SIGKILL escalation window.
+	// parentCancelGraceTimeout is 1s; SIGQUIT should be near-instant.
+	const maxExpected = 500 * time.Millisecond
+	if elapsed > maxExpected {
+		t.Fatalf("shutdown took %v (> %v) — SIGQUIT may not have been delivered (process likely waited for SIGKILL)", elapsed, maxExpected)
+	}
+	t.Logf("shutdown completed in %v (SIGQUIT delivered)", elapsed)
 }
