@@ -13,8 +13,9 @@ When using vLLM with llama-swap, you can leverage vLLM's sleep mode to drastical
 
 ## Prerequisites
 
-- vLLM server must be started with `--enable-sleep-mode`.
+- vLLM server must be started with `--enable-sleep-mode` and the `VLLM_SERVER_DEV_MODE=1` environment variable (required for sleep/wake endpoints).
 - The vLLM server must be reachable at the URL provided to the wrapper.
+- For sleep level 2: weights are discarded from GPU entirely on sleep. Wake requires reloading from disk. Ensure the model checkpoint is accessible.
 - To enable automatic start‑if‑not‑running, provide a `--start-cmd` flag with a command that launches the vLLM server (e.g., a `docker run` command that includes `--enable-sleep-mode`). The wrapper will start the daemon if it is not reachable, then wait for it to become healthy.
 
 ## Installation
@@ -43,6 +44,9 @@ models:
     cmd: vllm-wrapper serve --vllm-url http://127.0.0.1:8000 --listen :${PORT} --start-cmd "docker run --rm -p 8000:8000 ... --enable-sleep-mode"
     # Optional flags:
     #   --sleep-level: sleep level to use when sleeping (default: 1)
+    #   --sleep-mode: sleep mode for in-flight request handling (default: "wait")
+    #     - wait: wait for in-flight requests to complete before sleeping
+    #     - abort: immediately abort in-flight requests
     #   --health-path: health check path (default: /health)
     #   --wait-timeout: timeout waiting for daemon to become healthy (default: 120s)
 ```
@@ -63,24 +67,25 @@ Configure your model's `cmdStop` to invoke `vllm-wrapper sleep`:
 ```yaml
 models:
   my-vllm-model:
-    cmdStop: vllm-wrapper sleep --vllm-url http://127.0.0.1:8000
-    # Optional flag:
+    cmdStop: vllm-wrapper sleep --vllm-url http://127.0.0.1:8000 --sleep-level 2 --sleep-mode wait
+    # Optional flags:
     #   --sleep-level: sleep level to use (default: 1)
+    #   --sleep-mode: sleep mode for in-flight request handling (default: "wait")
 ```
 
 When llama-swap stops the model, it will:
-1. Send a sleep request to the vLLM daemon (POST to `/sleep` with JSON `{"level": 1}`).
+1. Send a sleep request to the vLLM daemon (POST `/sleep?level=2&mode=wait`).
 2. Exit with status 0, leaving the vLLM daemon running but asleep.
 
 ## Example Configuration
 
-Here is a complete example using vLLM with sleep mode, demonstrating cold start on first swap‑in and fast wake‑up on subsequent swaps:
+Here is a complete example using vLLM with sleep level 2, demonstrating cold start on first swap‑in and full VRAM recovery on swap-out:
 
 ```yaml
 models:
   qwen-7b-chat:
-    cmd: vllm-wrapper serve --vllm-url http://127.0.0.1:8000 --listen :${PORT} --start-cmd "docker run --rm -p 8000:8000 ... --enable-sleep-mode"
-    cmdStop: vllm-wrapper sleep --vllm-url http://127.0.0.1:8000
+    cmd: vllm-wrapper serve --vllm-url http://127.0.0.1:8000 --listen :${PORT} --sleep-level 2 --start-cmd "VLLM_SERVER_DEV_MODE=1 vllm serve Qwen/Qwen2.5-7B-Instruct --enable-sleep-mode --port 8000"
+    cmdStop: vllm-wrapper sleep --vllm-url http://127.0.0.1:8000 --sleep-level 2 --sleep-mode wait --pid ${PID}
     # You may also want to set a TTL to automatically unload after a period of inactivity:
     ttl: 3600   # unload after 1 hour of inactivity
 ```
@@ -90,14 +95,36 @@ models:
 ### serve subcommand
 
 1. **Health check**: Sends a GET request to `${vllm-url}${health-path}` (default `/health`). If the response is HTTP 200, the daemon is considered healthy and awake, and we proceed to step 4.
-2. **Wake up**: If the health check fails (non‑200 or connection error), send a POST request to `${vllm-url}/wake_up`. If the wake‑up succeeds (HTTP 200 or 204), proceed to step 4.
+2. **Wake up**: If the health check fails (non‑200 or connection error), wake the daemon. The wake sequence depends on the sleep level:
+
+   **Level 1 wake** (default): Sends `POST /wake_up` to restore weights from CPU RAM. Fast (~0.1-0.8s).
+
+   **Level 2 wake** (when `--sleep-level 2`): Multi-step sequence:
+   1. `POST /wake_up?tags=weights` — allocate GPU memory for weights
+   2. `POST /collective_rpc` with `{"method": "reload_weights"}` — reload weights from disk
+   3. `POST /wake_up?tags=kv_cache` — allocate GPU memory for KV cache
+   4. `POST /reset_prefix_cache` — reset prefix cache (warning logged if this fails)
+
+   Steps 1-3 must succeed or the wrapper exits with a fatal error. Step 4 failure is non-fatal (warning only).
+
+   After a level-2 wake, health is polled with the full `--wait-timeout` (default 120s) to allow time for weight reload.
+
 3. **Start daemon**: If the wake‑up fails (indicating the daemon is not running), execute the command specified by `--start-cmd` (run via `sh -c`). The wrapper starts the command as a child process, then waits for the daemon to become healthy by polling the health path.
 4. **Reverse proxy**: Once the daemon is healthy, start an HTTP server listening on `${PORT}` (or the address provided to `--listen`) that proxies all requests to the vLLM upstream URL. The proxy preserves streaming responses by setting `X-Accel-Buffering: no`.
 
 ### sleep subcommand
 
-1. Sends a POST request to `${vllm-url}/sleep` with a JSON body `{"level": <level>}` where `<level>` is the sleep level (default 1).
+1. Sends a POST request to `${vllm-url}/sleep?level=N&mode=M` where `N` is the sleep level (default 1) and `M` is the sleep mode (default "wait").
 2. Upon receiving a successful response (HTTP 200), exits with status 0.
+
+## Signal Handling
+
+The `serve` subcommand distinguishes between normal swap-out and hard shutdown via OS signals:
+
+- **SIGTERM / SIGINT**: Graceful proxy shutdown. The vLLM daemon is left running (sleeping or awake). This is the normal path when llama-swap swaps models — `cmdStop` puts the daemon to sleep, then the proxy exits.
+- **SIGQUIT**: Hard shutdown. If the wrapper started the vLLM daemon via `--start-cmd`, it sends SIGKILL to the daemon process before exiting. This is used during config reloads to prevent orphaned vLLM processes.
+
+Note: If the vLLM daemon was already running (not started by `--start-cmd`), SIGQUIT only shuts down the proxy — it does not kill externally-managed daemons.
 
 ## Notes
 
@@ -105,7 +132,6 @@ models:
 - It is designed to be simple and robust.
 - For production use, ensure the vLLM daemon is properly managed (e.g., restarted if it crashes) outside of this wrapper.
 - The wrapper does not handle TLS certificates; if your vLLM server uses HTTPS, provide the appropriate URL and ensure the system's root CAs are configured.
-- On SIGTERM/SIGINT, the wrapper exits cleanly and does **not** kill the vLLM daemon, allowing it to be slept later.
 
 ## Building
 

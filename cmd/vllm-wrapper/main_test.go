@@ -2,29 +2,30 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
 
 func TestWakeUpVLLM(t *testing.T) {
-	// Test successful wake up
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/wake_up" {
 			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
+		}
+		if r.URL.Query().Get("tags") != "" {
+			t.Errorf("Level-1 wake should not include tags param, got: %s", r.URL.Query().Get("tags"))
 		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	defer ts.Close()
 
-	if err := wakeUpVLLM(ts.URL); err != nil {
+	if err := wakeUpVLLM(ts.URL, 1); err != nil {
 		t.Fatalf("wakeUpVLLM failed: %v", err)
 	}
 
-	// Test failure when server returns error
 	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/wake_up" {
 			t.Errorf("Unexpected request: %s %s", r.Method, r.URL.Path)
@@ -33,13 +34,194 @@ func TestWakeUpVLLM(t *testing.T) {
 	}))
 	defer ts2.Close()
 
-	if err := wakeUpVLLM(ts2.URL); err == nil {
+	if err := wakeUpVLLM(ts2.URL, 1); err == nil {
 		t.Errorf("wakeUpVLLM expected error for non-200 response")
 	}
 }
 
+func TestVllmWrapper_WakeUpLevel2(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []struct {
+			method string
+			path   string
+			query  string
+			body   string
+		}
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 4096)
+		n, _ := r.Body.Read(buf)
+		_ = r.Body.Close()
+		body := string(buf[:n])
+
+		mu.Lock()
+		requests = append(requests, struct {
+			method string
+			path   string
+			query  string
+			body   string
+		}{
+			method: r.Method,
+			path:   r.URL.Path,
+			query:  r.URL.RawQuery,
+			body:   body,
+		})
+		mu.Unlock()
+
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	err := wakeUpVLLM(ts.URL, 2)
+	if err != nil {
+		t.Fatalf("wakeUpVLLM(url, 2) failed: %v", err)
+	}
+
+	mu.Lock()
+	reqs := requests
+	mu.Unlock()
+
+	if len(reqs) != 4 {
+		t.Fatalf("Expected 4 requests, got %d", len(reqs))
+	}
+
+	if reqs[0].method != http.MethodPost || reqs[0].path != "/wake_up" || reqs[0].query != "tags=weights" || strings.TrimSpace(reqs[0].body) != "" {
+		t.Errorf("Step 1 invalid: %s %s?%s body=%q", reqs[0].method, reqs[0].path, reqs[0].query, reqs[0].body)
+	}
+
+	if reqs[1].method != http.MethodPost || reqs[1].path != "/collective_rpc" || !strings.Contains(reqs[1].body, `"method":"reload_weights"`) {
+		t.Errorf("Step 2 invalid: %s %s body=%q", reqs[1].method, reqs[1].path, reqs[1].body)
+	}
+
+	if reqs[2].method != http.MethodPost || reqs[2].path != "/wake_up" || reqs[2].query != "tags=kv_cache" || strings.TrimSpace(reqs[2].body) != "" {
+		t.Errorf("Step 3 invalid: %s %s?%s body=%q", reqs[2].method, reqs[2].path, reqs[2].query, reqs[2].body)
+	}
+
+	if reqs[3].method != http.MethodPost || reqs[3].path != "/reset_prefix_cache" || strings.TrimSpace(reqs[3].body) != "" {
+		t.Errorf("Step 4 invalid: %s %s body=%q", reqs[3].method, reqs[3].path, reqs[3].body)
+	}
+}
+
+func TestVllmWrapper_WakeUpLevel2FailFast(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		requests []struct {
+			method string
+			path   string
+			query  string
+		}
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.Body.Close()
+
+		mu.Lock()
+		requests = append(requests, struct {
+			method string
+			path   string
+			query  string
+		}{
+			method: r.Method,
+			path:   r.URL.Path,
+			query:  r.URL.RawQuery,
+		})
+		mu.Unlock()
+
+		if r.URL.Path == "/collective_rpc" {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	err := wakeUpVLLM(ts.URL, 2)
+	if err == nil {
+		t.Fatalf("Expected error on step 2 failure, got nil")
+	}
+
+	mu.Lock()
+	reqs := requests
+	mu.Unlock()
+
+	// step 1 (1 req) + step 2 retries (5 attempts) = 6 total
+	if len(reqs) != 6 {
+		t.Fatalf("Expected 6 requests (1 + 5 retries), got %d", len(reqs))
+	}
+
+	if reqs[0].path != "/wake_up" || reqs[0].query != "tags=weights" {
+		t.Errorf("Step 1 unexpected: %s %s", reqs[0].path, reqs[0].query)
+	}
+	if reqs[1].path != "/collective_rpc" {
+		t.Errorf("Step 2 unexpected: %s", reqs[1].path)
+	}
+}
+
+func TestVllmWrapper_WakeUpLevel2ResetPrefixCacheWarning(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = r.Body.Close()
+		path := r.URL.Path
+
+		switch path {
+		case "/wake_up", "/collective_rpc":
+			w.WriteHeader(http.StatusOK)
+		case "/reset_prefix_cache":
+			w.WriteHeader(http.StatusInternalServerError)
+		default:
+			t.Errorf("Unexpected path: %s", path)
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer ts.Close()
+
+	err := wakeUpVLLM(ts.URL, 2)
+	if err != nil {
+		t.Fatalf("wakeUpVLLM should not return error for step 4 failure, got: %v", err)
+	}
+}
+
+func TestVllmWrapper_SleepQueryParams(t *testing.T) {
+	tests := []struct {
+		name     string
+		level    int
+		mode     string
+		expected string
+	}{
+		{"level-2-wait", 2, "wait", "level=2&mode=wait"},
+		{"level-2-abort", 2, "abort", "level=2&mode=abort"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost || r.URL.Path != "/sleep" {
+					t.Errorf("Expected POST /sleep, got %s %s", r.Method, r.URL.Path)
+				}
+				buf := make([]byte, 4096)
+				n, _ := r.Body.Read(buf)
+				_ = r.Body.Close()
+				body := strings.TrimSpace(string(buf[:n]))
+				if body != "" && strings.HasPrefix(body, "{") {
+					t.Errorf("Expected no JSON body, got %q", body)
+				}
+				if r.URL.RawQuery != tt.expected {
+					t.Errorf("Expected query %q, got %q", tt.expected, r.URL.RawQuery)
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer ts.Close()
+
+			err := sendSleepRequest(ts.URL, tt.level, tt.mode)
+			if err != nil {
+				t.Fatalf("sendSleepRequest failed: %v", err)
+			}
+		})
+	}
+}
+
 func TestWaitForHealthy(t *testing.T) {
-	// Test successful health check
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
 			t.Errorf("Unexpected path: %s", r.URL.Path)
@@ -53,9 +235,7 @@ func TestWaitForHealthy(t *testing.T) {
 		t.Fatalf("waitForHealthy failed: %v", err)
 	}
 
-	// Test timeout: server delays response longer than context timeout
 	ts2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Delay 2 seconds
 		time.Sleep(2 * time.Second)
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"data":[]}`))
@@ -72,27 +252,13 @@ func TestWaitForHealthy(t *testing.T) {
 	}
 }
 
-func TestSleepCommandMarshal(t *testing.T) {
-	// We test the sleep command by checking the JSON marshaling we use in sleepCmd.
-	// Since sleepCmd is not easily unit-testable without exposing more, we test the structure.
-	body := map[string]int{"level": 1}
-	data, err := json.Marshal(body)
-	if err != nil {
-		t.Fatalf("Failed to marshal: %v", err)
-	}
-	expected := `{"level":1}`
-	if string(data) != expected {
-		t.Errorf("Expected %s, got %s", expected, string(data))
-	}
-}
-
-// TestStartDaemon tests that startDaemon returns an error when the start command exits
-// quickly and the daemon does not become healthy.
 func TestStartDaemon(t *testing.T) {
-	// Use a start command that exits immediately (true) and a health URL that will not respond.
-	err := startDaemon("true", "http://127.0.0.1:12345/health", "/health", 10*time.Millisecond)
+	pid, err := startDaemon("true", "http://127.0.0.1:12345/health", "/health", 10*time.Millisecond)
 	if err == nil {
 		t.Fatalf("startDaemon expected error but got nil")
+	}
+	if pid != 0 {
+		t.Errorf("startDaemon expected pid=0 on failure, got %d", pid)
 	}
 	if !strings.Contains(err.Error(), "daemon did not become healthy") {
 		t.Errorf("error expected to contain 'daemon did not become healthy', got %v", err)

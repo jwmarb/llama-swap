@@ -33,6 +33,12 @@ func killProcessTree(cmd *exec.Cmd) error {
 	return taskkillProcessTree(cmd, true)
 }
 
+// quitProcessTree falls back to terminateProcessTree on Windows since
+// SIGQUIT does not exist on the platform.
+func quitProcessTree(cmd *exec.Cmd) error {
+	return terminateProcessTree(cmd)
+}
+
 // taskkillProcessTree runs taskkill against cmd.Process.Pid. The /t flag
 // terminates the process together with any child processes it started, which is
 // the Windows analogue of signalling a Unix process group via its negative PID.
