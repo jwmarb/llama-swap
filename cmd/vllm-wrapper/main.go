@@ -231,6 +231,7 @@ func sendSleepRequest(vllmURL string, level int, mode string) error {
 }
 
 func wakeUpVLLM(vllmURL string, sleepLevel int) error {
+	log.Printf("Waking up vLLM (sleep level %d)", sleepLevel)
 	if sleepLevel == 1 {
 		return wakeUpVLLMLvl1(vllmURL)
 	}
@@ -257,12 +258,15 @@ func wakeUpVLLMLvl1(vllmURL string) error {
 }
 
 func wakeUpVLLMLvl2(vllmURL string) error {
+	log.Printf("Level-2 wake: step 1/4 - POST /wake_up?tags=weights")
 	if err := doPostCheck(vllmURL+"/wake_up?tags=weights", http.MethodPost, nil, []int{http.StatusOK, http.StatusNoContent}); err != nil {
 		return fmt.Errorf("step 1 (wake_up weights): %w", err)
 	}
+	log.Printf("Level-2 wake: step 1/4 complete")
 
 	// Step 2: reload_weights via collective_rpc. The weights pool allocation
 	// from step 1 may be async, so retry a few times with backoff.
+	log.Printf("Level-2 wake: step 2/4 - POST /collective_rpc (reload_weights)")
 	var lastErr error
 	for attempt := 0; attempt < 5; attempt++ {
 		if attempt > 0 {
@@ -273,16 +277,20 @@ func wakeUpVLLMLvl2(vllmURL string) error {
 		if lastErr == nil {
 			break
 		}
-		log.Printf("step 2 (collective_rpc) attempt %d failed: %v, retrying...", attempt+1, lastErr)
+		log.Printf("Level-2 wake: step 2/4 attempt %d failed: %v, retrying...", attempt+1, lastErr)
 	}
 	if lastErr != nil {
 		return fmt.Errorf("step 2 (collective_rpc): %w", lastErr)
 	}
+	log.Printf("Level-2 wake: step 2/4 complete")
 
+	log.Printf("Level-2 wake: step 3/4 - POST /wake_up?tags=kv_cache")
 	if err := doPostCheck(vllmURL+"/wake_up?tags=kv_cache", http.MethodPost, nil, []int{http.StatusOK, http.StatusNoContent}); err != nil {
 		return fmt.Errorf("step 3 (wake_up kv_cache): %w", err)
 	}
+	log.Printf("Level-2 wake: step 3/4 complete")
 
+	log.Printf("Level-2 wake: step 4/4 - POST /reset_prefix_cache")
 	req, err := http.NewRequest(http.MethodPost, vllmURL+"/reset_prefix_cache", nil)
 	if err != nil {
 		log.Printf("Warning: step 4: failed to create /reset_prefix_cache request: %v", err)
@@ -296,6 +304,8 @@ func wakeUpVLLMLvl2(vllmURL string) error {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("Warning: step 4: /reset_prefix_cache returned status %d: %s", resp.StatusCode, resp.Status)
+	} else {
+		log.Printf("Level-2 wake: step 4/4 complete")
 	}
 	return nil
 }
