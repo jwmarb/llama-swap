@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -12,8 +14,10 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -155,6 +159,10 @@ func serveCmd(args []string) {
 	if sig == syscall.SIGQUIT && daemonPID > 0 {
 		log.Printf("SIGQUIT received, killing vLLM daemon (pid %d)", daemonPID)
 		syscall.Kill(daemonPID, syscall.SIGKILL)
+	}
+
+	if daemonLogStop != nil {
+		daemonLogStop()
 	}
 
 	log.Println("Shutting down vllm-wrapper serve...")
@@ -368,19 +376,97 @@ func checkHealthy(vllmURL string, healthPath string) error {
 }
 
 func startDaemon(startCmd string, vllmURL string, healthPath string, waitTimeout time.Duration) (int, error) {
+	logFile, err := openDaemonLogFile()
+	if err != nil {
+		return 0, fmt.Errorf("failed to create daemon log file: %w", err)
+	}
+
 	cmd := exec.Command("sh", "-c", startCmd)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
+	cmd.Stdout = logFile
+	cmd.Stderr = logFile
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 	if err := cmd.Start(); err != nil {
+		logFile.Close()
 		return 0, fmt.Errorf("failed to start daemon command: %w", err)
 	}
 
 	log.Printf("Started daemon with PID %d, waiting for healthy state", cmd.Process.Pid)
-	err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout)
+
+	stopTail := tailFile(logFile)
+
+	err = waitForHealthyWithPath(vllmURL, healthPath, waitTimeout)
 	if err != nil {
+		stopTail()
 		_ = cmd.Process.Kill()
 		return 0, fmt.Errorf("daemon did not become healthy: %w", err)
 	}
 
+	daemonLogStop = stopTail
+
 	return cmd.Process.Pid, nil
+}
+
+var daemonLogStop func()
+
+func openDaemonLogFile() (*os.File, error) {
+	logDir := filepath.Join(os.TempDir(), "vllm-wrapper")
+	if err := os.MkdirAll(logDir, 0755); err != nil {
+		return nil, err
+	}
+	logPath := filepath.Join(logDir, "daemon.log")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, err
+	}
+	log.Printf("Daemon log file: %s", logPath)
+	return f, nil
+}
+
+// tailFile opens a read-only handle on the same log file and streams new
+// lines to os.Stdout. A separate fd is needed because the write handle is
+// held by the daemon process. We seek to end so only output produced after
+// this invocation is printed.
+func tailFile(f *os.File) func() {
+	rf, err := os.Open(f.Name())
+	if err != nil {
+		log.Printf("Warning: cannot tail daemon log: %v", err)
+		return func() {}
+	}
+
+	rf.Seek(0, io.SeekEnd)
+
+	done := make(chan struct{})
+	go func() {
+		defer rf.Close()
+		reader := bufio.NewReader(rf)
+		for {
+			select {
+			case <-done:
+				for {
+					line, err := reader.ReadString('\n')
+					if line != "" {
+						fmt.Fprint(os.Stdout, line)
+					}
+					if err != nil {
+						break
+					}
+				}
+				return
+			default:
+			}
+
+			line, err := reader.ReadString('\n')
+			if line != "" {
+				fmt.Fprint(os.Stdout, line)
+			}
+			if err != nil {
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
+
+	var once sync.Once
+	return func() {
+		once.Do(func() { close(done) })
+	}
 }

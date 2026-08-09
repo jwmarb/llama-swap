@@ -4,8 +4,10 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -264,4 +266,52 @@ func TestStartDaemon(t *testing.T) {
 	if !strings.Contains(err.Error(), "daemon did not become healthy") {
 		t.Errorf("error expected to contain 'daemon did not become healthy', got %v", err)
 	}
+}
+
+func TestStartDaemon_SurvivesParentExit(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+
+	pid, err := startDaemon("sleep 30", ts.URL, "/", 5*time.Second)
+	if err != nil {
+		t.Fatalf("startDaemon failed: %v", err)
+	}
+	if pid == 0 {
+		t.Fatal("expected non-zero pid")
+	}
+
+	if daemonLogStop != nil {
+		daemonLogStop()
+		daemonLogStop = nil
+	}
+
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatalf("FindProcess(%d) failed: %v", pid, err)
+	}
+	// Signal 0 checks process liveness without delivering a real signal
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		t.Errorf("daemon process %d died after tail stop: %v", pid, err)
+	}
+
+	proc.Kill()
+}
+
+func TestTailFile(t *testing.T) {
+	tmpFile, err := os.CreateTemp(t.TempDir(), "tailtest")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := tailFile(tmpFile)
+	defer stop()
+
+	tmpFile.WriteString("line one\n")
+	tmpFile.WriteString("line two\n")
+	tmpFile.Sync()
+
+	time.Sleep(250 * time.Millisecond)
+	stop()
 }
