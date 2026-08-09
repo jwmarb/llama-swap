@@ -18,13 +18,12 @@ import (
 	"time"
 )
 
-// httpTimeout is the default timeout for HTTP requests to the vLLM daemon.
-// This prevents indefinite hangs when the daemon is unresponsive.
-const httpTimeout = 30 * time.Second
+// sleepLevel represents the vLLM sleep level.
+type sleepLevel int
 
-// httpClient is used for all control-plane requests (sleep, wake, health)
-// with a timeout to prevent indefinite blocking.
-var httpClient = &http.Client{Timeout: httpTimeout}
+const (
+	sleepLevel1 sleepLevel = 1
+)
 
 // vllmWrapper serves as a cmd/cmdStop wrapper for vLLM with sleep mode.
 func main() {
@@ -298,33 +297,19 @@ func checkHealthy(vllmURL string, healthPath string) error {
 }
 
 // startDaemon executes the start command and waits for the vLLM daemon to become healthy.
-// The daemon is started in its own process group so that it survives when llama-swap
-// SIGKILLs the wrapper's process group during unload. Its stdout/stderr are kept
-// connected to the wrapper so logs flow through to llama-swap's web UI.
 func startDaemon(startCmd string, vllmURL string, healthPath string, waitTimeout time.Duration) error {
 	cmd := exec.Command("sh", "-c", startCmd)
-
-	// Give the daemon its own process group so it is NOT killed when
-	// llama-swap sends SIGKILL to the wrapper's process group. This is
-	// what makes sleep mode actually work — the daemon survives unload.
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-
-	// Keep daemon output connected to the wrapper's stdout/stderr so vLLM
-	// logs are visible in llama-swap's web UI. The daemon holds the pipe
-	// write-ends after the wrapper exits, but llama-swap's WaitDelay (10s)
-	// handles forced pipe cleanup. With --pid ${PID} ensuring the wrapper
-	// exits promptly on sleep, this adds at most 10s to the unload.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start daemon command: %w", err)
 	}
 	// Wait for healthy state.
 	log.Printf("Started daemon with PID %d, waiting for healthy state", cmd.Process.Pid)
-	if err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout); err != nil {
-		// If we fail to become healthy, kill the started process group.
-		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout)
+	if err != nil {
+		// If we fail to become healthy, kill the started process.
+		_ = cmd.Process.Kill()
 		return fmt.Errorf("daemon did not become healthy: %w", err)
 	}
 	// Daemon is healthy, we don't wait for the command to exit (it should keep running).
