@@ -18,12 +18,13 @@ import (
 	"time"
 )
 
-// sleepLevel represents the vLLM sleep level.
-type sleepLevel int
+// httpTimeout is the default timeout for HTTP requests to the vLLM daemon.
+// This prevents indefinite hangs when the daemon is unresponsive.
+const httpTimeout = 30 * time.Second
 
-const (
-	sleepLevel1 sleepLevel = 1
-)
+// httpClient is used for all control-plane requests (sleep, wake, health)
+// with a timeout to prevent indefinite blocking.
+var httpClient = &http.Client{Timeout: httpTimeout}
 
 // vllmWrapper serves as a cmd/cmdStop wrapper for vLLM with sleep mode.
 func main() {
@@ -175,10 +176,12 @@ func sleepCmd(args []string) {
 	var (
 		vllmURL    string
 		sleepLevel int
+		servePID   int
 	)
 	fs := flag.NewFlagSet("sleep", flag.ExitOnError)
 	fs.StringVar(&vllmURL, "vllm-url", "", "Base URL of vLLM server (e.g., http://127.0.0.1:8000)")
 	fs.IntVar(&sleepLevel, "sleep-level", 1, "Sleep level to use (default 1)")
+	fs.IntVar(&servePID, "pid", 0, "PID of the serve process to signal after sleep succeeds (optional)")
 	fs.Parse(args)
 
 	if vllmURL == "" {
@@ -193,8 +196,14 @@ func sleepCmd(args []string) {
 		log.Fatalf("Failed to marshal sleep request: %v", err)
 	}
 
-	// Send POST to /sleep endpoint.
-	resp, err := http.Post(vllmURL+"/sleep", "application/json", strings.NewReader(string(jsonBody)))
+	// Send POST to /sleep endpoint with a timeout.
+	req, err := http.NewRequest(http.MethodPost, vllmURL+"/sleep", strings.NewReader(string(jsonBody)))
+	if err != nil {
+		log.Fatalf("Failed to create sleep request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		log.Fatalf("Failed to send sleep request: %v", err)
 	}
@@ -205,12 +214,28 @@ func sleepCmd(args []string) {
 	}
 
 	log.Printf("Successfully put vLLM to sleep (level %d)", sleepLevel)
+
+	// If a serve PID was provided, send SIGTERM to tell it to exit gracefully.
+	// This allows llama-swap to detect the process exit immediately without
+	// waiting for the full unloadTimeout + SIGKILL escalation.
+	if servePID > 0 {
+		if err := syscall.Kill(servePID, syscall.SIGTERM); err != nil {
+			log.Printf("Warning: failed to signal serve process (pid %d): %v", servePID, err)
+		} else {
+			log.Printf("Sent SIGTERM to serve process (pid %d)", servePID)
+		}
+	}
 }
 
 // wakeUpVLLM sends a POST to /wake_up to wake the vLLM daemon.
 func wakeUpVLLM(vllmURL string) error {
-	// The wake_up endpoint may not require a body; we'll send a POST with empty body.
-	resp, err := http.Post(vllmURL+"/wake_up", "application/json", strings.NewReader(""))
+	req, err := http.NewRequest(http.MethodPost, vllmURL+"/wake_up", strings.NewReader(""))
+	if err != nil {
+		return fmt.Errorf("failed to create /wake_up request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to POST /wake_up: %w", err)
 	}
@@ -234,7 +259,7 @@ func waitForHealthyWithPath(vllmURL string, healthPath string, timeout time.Dura
 		if err != nil {
 			return err
 		}
-		resp, err := http.DefaultClient.Do(req)
+		resp, err := httpClient.Do(req)
 		if err != nil {
 			// If context canceled, break.
 			if ctx.Err() != nil {
@@ -257,7 +282,11 @@ func waitForHealthyWithPath(vllmURL string, healthPath string, timeout time.Dura
 
 // checkHealthy sends a GET request to the health path and returns nil if the response status is 200 OK.
 func checkHealthy(vllmURL string, healthPath string) error {
-	resp, err := http.Get(vllmURL + healthPath)
+	req, err := http.NewRequest(http.MethodGet, vllmURL+healthPath, nil)
+	if err != nil {
+		return err
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -269,20 +298,33 @@ func checkHealthy(vllmURL string, healthPath string) error {
 }
 
 // startDaemon executes the start command and waits for the vLLM daemon to become healthy.
+// The daemon is started in its own process group so that it survives when llama-swap
+// SIGKILLs the wrapper's process group during unload. Its stdout/stderr are kept
+// connected to the wrapper so logs flow through to llama-swap's web UI.
 func startDaemon(startCmd string, vllmURL string, healthPath string, waitTimeout time.Duration) error {
-	// Start the daemon command.
 	cmd := exec.Command("sh", "-c", startCmd)
+
+	// Give the daemon its own process group so it is NOT killed when
+	// llama-swap sends SIGKILL to the wrapper's process group. This is
+	// what makes sleep mode actually work — the daemon survives unload.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+
+	// Keep daemon output connected to the wrapper's stdout/stderr so vLLM
+	// logs are visible in llama-swap's web UI. The daemon holds the pipe
+	// write-ends after the wrapper exits, but llama-swap's WaitDelay (10s)
+	// handles forced pipe cleanup. With --pid ${PID} ensuring the wrapper
+	// exits promptly on sleep, this adds at most 10s to the unload.
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("failed to start daemon command: %w", err)
 	}
 	// Wait for healthy state.
 	log.Printf("Started daemon with PID %d, waiting for healthy state", cmd.Process.Pid)
-	err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout)
-	if err != nil {
-		// If we fail to become healthy, kill the started process.
-		_ = cmd.Process.Kill()
+	if err := waitForHealthyWithPath(vllmURL, healthPath, waitTimeout); err != nil {
+		// If we fail to become healthy, kill the started process group.
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		return fmt.Errorf("daemon did not become healthy: %w", err)
 	}
 	// Daemon is healthy, we don't wait for the command to exit (it should keep running).
