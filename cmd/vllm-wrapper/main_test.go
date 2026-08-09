@@ -222,6 +222,7 @@ func TestVllmWrapper_SleepQueryParams(t *testing.T) {
 }
 
 func TestWaitForHealthy(t *testing.T) {
+	// Test successful health check
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/v1/models" {
 			t.Errorf("Unexpected path: %s", r.URL.Path)
