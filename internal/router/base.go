@@ -283,24 +283,35 @@ func (b *baseRouter) handleShutdown(req shutdownReq) {
 	// The OnShutdown grants below then either land (waiter happened to receive
 	// before noticing shutdown) or fall through immediately via grant's
 	// shutdownCtx case — either way the waiter sees a non-OK response.
-	// This does NOT touch processes: their lifetime is procCtx, cancelled
-	// only after the graceful Stop() calls below have reaped them.
 	b.shutdownFn()
 
 	b.schedule.OnShutdown(shutdownErr)
+
+	// Cancel procCtx BEFORE stopping processes. This triggers the
+	// parentCtx.Done() handler in each process's run loop, which sends
+	// SIGQUIT (skipping CmdStop) to the process group. This is critical
+	// for wrappers like vllm-wrapper that distinguish normal swap-out
+	// (SIGTERM via CmdStop — leaves the daemon sleeping) from hard
+	// teardown (SIGQUIT — kills the daemon). Without this, Stop() would
+	// use the CmdStop/SIGTERM path and the daemon would survive.
+	b.procCancel()
 
 	stopTimeout := req.timeout
 	if stopTimeout <= 0 {
 		stopTimeout = b.healthCheckTimeout()
 	}
 
+	// Stop() calls below are effectively no-ops for real processes (their
+	// parentCtx is already cancelled so Stop returns immediately), but they
+	// satisfy the Process interface contract and allow test fakes to observe
+	// the shutdown.
 	var wg sync.WaitGroup
 	for i, p := range b.processes {
 		wg.Add(1)
 		go func(id string, p process.Process) {
 			defer wg.Done()
 			if err := p.Stop(stopTimeout); err != nil {
-				b.logger.Warnf("%s failed to stop process %s: %v", b.name, id, err)
+				b.logger.Debugf("%s process %s stop during shutdown: %v", b.name, id, err)
 			}
 		}(i, p)
 	}
@@ -320,11 +331,6 @@ func (b *baseRouter) handleShutdown(req shutdownReq) {
 	} else {
 		<-done
 	}
-
-	// Every process is stopped (children reaped via Stop()). Cancel procCtx so
-	// the process run-loop goroutines exit; they are already StateStopped, so
-	// this is a clean no-op kill rather than a forced teardown.
-	b.procCancel()
 
 	req.respond <- nil
 }

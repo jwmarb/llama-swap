@@ -162,8 +162,11 @@ func serveCmd(args []string) {
 	sig := <-c
 
 	if sig == syscall.SIGQUIT && daemonPID > 0 {
-		log.Printf("SIGQUIT received, killing vLLM daemon (pid %d)", daemonPID)
-		syscall.Kill(daemonPID, syscall.SIGKILL)
+		log.Printf("SIGQUIT received, killing vLLM daemon process group (pid %d)", daemonPID)
+		if err := syscall.Kill(-daemonPID, syscall.SIGKILL); err != nil {
+			log.Printf("process group kill failed, killing pid directly: %v", err)
+			syscall.Kill(daemonPID, syscall.SIGKILL)
+		}
 	}
 
 	if daemonLogStop != nil {
