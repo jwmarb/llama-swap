@@ -133,6 +133,14 @@ Note: If the vLLM daemon was already running (not started by `--start-cmd`), SIG
 - For production use, ensure the vLLM daemon is properly managed (e.g., restarted if it crashes) outside of this wrapper.
 - The wrapper does not handle TLS certificates; if your vLLM server uses HTTPS, provide the appropriate URL and ensure the system's root CAs are configured.
 
+## Per-Request Metrics
+
+The wrapper automatically injects `"include_metrics": true` into POST requests to `/v1/chat/completions` and `/v1/completions`. This enables vLLM's per-request timing metrics (`time_to_first_token_ms`, `mean_itl_ms`, etc.) in responses, which llama-swap uses for activity tracking.
+
+For streaming requests (where `"stream": true`), the wrapper also sets `stream_options.include_usage: true` so the final SSE chunk includes usage and metrics data.
+
+**Prerequisite**: The vLLM server must be started with `--enable-per-request-metrics` for this to take effect.
+
 ## Building
 
 ```bash

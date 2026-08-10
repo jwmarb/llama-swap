@@ -1,9 +1,14 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -314,4 +319,193 @@ func TestTailFile(t *testing.T) {
 
 	time.Sleep(250 * time.Millisecond)
 	stop()
+}
+
+func TestVllmWrapper_InjectMetricsParams(t *testing.T) {
+	t.Run("non-streaming", func(t *testing.T) {
+		body := `{"model":"test","messages":[{"role":"user","content":"hi"}]}`
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+		r.Header.Set("Content-Type", "application/json")
+
+		injectMetricsParams(r)
+
+		result, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		if err := json.Unmarshal(result, &data); err != nil {
+			t.Fatalf("failed to parse modified body: %v", err)
+		}
+
+		if data["include_metrics"] != true {
+			t.Errorf("include_metrics = %v, want true", data["include_metrics"])
+		}
+		if data["stream_options"] != nil {
+			t.Errorf("stream_options should not be set for non-streaming request")
+		}
+	})
+
+	t.Run("streaming", func(t *testing.T) {
+		body := `{"model":"test","messages":[],"stream":true}`
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+
+		injectMetricsParams(r)
+
+		result, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		if err := json.Unmarshal(result, &data); err != nil {
+			t.Fatalf("failed to parse modified body: %v", err)
+		}
+
+		if data["include_metrics"] != true {
+			t.Errorf("include_metrics = %v, want true", data["include_metrics"])
+		}
+		opts, ok := data["stream_options"].(map[string]any)
+		if !ok {
+			t.Fatalf("stream_options not set for streaming request")
+		}
+		if opts["include_usage"] != true {
+			t.Errorf("stream_options.include_usage = %v, want true", opts["include_usage"])
+		}
+	})
+
+	t.Run("streaming with existing stream_options", func(t *testing.T) {
+		body := `{"model":"test","messages":[],"stream":true,"stream_options":{"continuous_usage_stats":true}}`
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+
+		injectMetricsParams(r)
+
+		result, _ := io.ReadAll(r.Body)
+		var data map[string]any
+		if err := json.Unmarshal(result, &data); err != nil {
+			t.Fatalf("failed to parse modified body: %v", err)
+		}
+
+		opts := data["stream_options"].(map[string]any)
+		if opts["include_usage"] != true {
+			t.Errorf("stream_options.include_usage = %v, want true", opts["include_usage"])
+		}
+		if opts["continuous_usage_stats"] != true {
+			t.Errorf("existing stream_options.continuous_usage_stats was clobbered")
+		}
+	})
+
+	t.Run("invalid JSON passes through unchanged", func(t *testing.T) {
+		original := `not valid json`
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(original))
+
+		injectMetricsParams(r)
+
+		result, _ := io.ReadAll(r.Body)
+		if string(result) != original {
+			t.Errorf("body = %q, want unchanged %q", result, original)
+		}
+	})
+
+	t.Run("nil body", func(t *testing.T) {
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+		r.Body = nil
+
+		injectMetricsParams(r)
+	})
+
+	t.Run("content-length updated", func(t *testing.T) {
+		body := `{"model":"x","messages":[]}`
+		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+
+		injectMetricsParams(r)
+
+		result, _ := io.ReadAll(r.Body)
+		if int64(len(result)) != r.ContentLength {
+			t.Errorf("ContentLength = %d, body len = %d", r.ContentLength, len(result))
+		}
+	})
+}
+
+func TestVllmWrapper_IsInferencePath(t *testing.T) {
+	tests := []struct {
+		path string
+		want bool
+	}{
+		{"/v1/chat/completions", true},
+		{"/v1/completions", true},
+		{"/v1/models", false},
+		{"/health", false},
+		{"/metrics", false},
+		{"/v1/embeddings", false},
+	}
+	for _, tt := range tests {
+		if got := isInferencePath(tt.path); got != tt.want {
+			t.Errorf("isInferencePath(%q) = %v, want %v", tt.path, got, tt.want)
+		}
+	}
+}
+
+func TestVllmWrapper_ProxyInjectsMetrics(t *testing.T) {
+	var receivedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"choices":[],"usage":{"prompt_tokens":5,"completion_tokens":10}}`))
+	}))
+	defer upstream.Close()
+
+	proxyURL, _ := url.Parse(upstream.URL)
+	proxy := httputil.NewSingleHostReverseProxy(proxyURL)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
+			injectMetricsParams(r)
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
+	reqBody := `{"model":"test","messages":[{"role":"user","content":"hello"}],"stream":true}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(reqBody))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(receivedBody, &data); err != nil {
+		t.Fatalf("upstream received invalid JSON: %v\nbody: %s", err, receivedBody)
+	}
+	if data["include_metrics"] != true {
+		t.Errorf("upstream did not receive include_metrics=true")
+	}
+	opts, ok := data["stream_options"].(map[string]any)
+	if !ok || opts["include_usage"] != true {
+		t.Errorf("upstream did not receive stream_options.include_usage=true, got %v", data["stream_options"])
+	}
+}
+
+func TestVllmWrapper_ProxySkipsNonInferencePaths(t *testing.T) {
+	var receivedBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		receivedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer upstream.Close()
+
+	proxyURL, _ := url.Parse(upstream.URL)
+	proxy := httputil.NewSingleHostReverseProxy(proxyURL)
+
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
+			injectMetricsParams(r)
+		}
+		proxy.ServeHTTP(w, r)
+	})
+
+	original := `{"query":"test"}`
+	req := httptest.NewRequest(http.MethodPost, "/v1/embeddings", strings.NewReader(original))
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	if !bytes.Equal(receivedBody, []byte(original)) {
+		t.Errorf("non-inference path body was modified: got %q, want %q", receivedBody, original)
+	}
 }

@@ -2,7 +2,9 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -141,6 +143,9 @@ func serveCmd(args []string) {
 	srv := &http.Server{
 		Addr: listenAddr,
 		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost && isInferencePath(r.URL.Path) {
+				injectMetricsParams(r)
+			}
 			proxy.ServeHTTP(w, r)
 		}),
 	}
@@ -479,4 +484,61 @@ func tailFile(f *os.File) func() {
 	return func() {
 		once.Do(func() { close(done) })
 	}
+}
+
+// inferencePaths lists the vLLM endpoints that support per-request metrics.
+var inferencePaths = []string{
+	"/v1/chat/completions",
+	"/v1/completions",
+}
+
+func isInferencePath(path string) bool {
+	for _, p := range inferencePaths {
+		if path == p {
+			return true
+		}
+	}
+	return false
+}
+
+// injectMetricsParams sets "include_metrics": true in the JSON request body
+// so vLLM returns per-request timing metrics. For streaming requests it also
+// sets stream_options.include_usage so the final chunk carries usage+metrics.
+func injectMetricsParams(r *http.Request) {
+	if r.Body == nil {
+		return
+	}
+
+	body, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil || len(body) == 0 {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+
+	var data map[string]any
+	if err := json.Unmarshal(body, &data); err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+
+	data["include_metrics"] = true
+
+	if stream, ok := data["stream"].(bool); ok && stream {
+		opts, _ := data["stream_options"].(map[string]any)
+		if opts == nil {
+			opts = make(map[string]any)
+		}
+		opts["include_usage"] = true
+		data["stream_options"] = opts
+	}
+
+	modified, err := json.Marshal(data)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(modified))
+	r.ContentLength = int64(len(modified))
 }
